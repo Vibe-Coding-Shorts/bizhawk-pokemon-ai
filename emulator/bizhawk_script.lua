@@ -265,14 +265,14 @@ end
 -- Save / Load state helpers
 -- ---------------------------------------------------------------------------
 local function save_state()
-    savestate.save(CONFIG.savestate_slot)
+    savestate.saveslot(CONFIG.savestate_slot)
     if CONFIG.debug then
         console.log("[LUA] State saved to slot " .. CONFIG.savestate_slot)
     end
 end
 
 local function load_state()
-    savestate.load(CONFIG.savestate_slot)
+    savestate.loadslot(CONFIG.savestate_slot)
     if CONFIG.debug then
         console.log("[LUA] State loaded from slot " .. CONFIG.savestate_slot)
     end
@@ -305,6 +305,12 @@ end
 -- comm.socketServerResponse(data)   – send data, return response string
 -- ---------------------------------------------------------------------------
 
+-- Configure socket connection to Python server.
+-- These calls set the IP/port so BizHawk 2.11+ does NOT require the
+-- --socket_ip / --socket_port command-line flags at launch.
+pcall(comm.socketServerSetIp, CONFIG.host)
+pcall(comm.socketServerSetPort, CONFIG.port)
+
 -- Wrap in pcall: BizHawk tries to connect immediately, which fails if Python
 -- isn't running yet.  We catch the error so the script keeps running and
 -- retries on every communicate() call (which is already wrapped in pcall).
@@ -317,9 +323,15 @@ end
 local function communicate(state)
     local json_str = to_json(state) .. "\n"
 
-    -- comm.socketServerResponse() sends json_str to the Python TCP server
-    -- and returns whatever Python sends back (the action string).
-    local ok, response = pcall(comm.socketServerResponse, json_str)
+    -- BizHawk 2.11+: comm.socketServerResponse() takes no arguments.
+    -- Use comm.socketServerSend() to push data, then socketServerResponse()
+    -- to read the reply.
+    local ok_send, _ = pcall(comm.socketServerSend, json_str)
+    if not ok_send then
+        return nil   -- no-op this frame (Python not ready yet)
+    end
+
+    local ok, response = pcall(comm.socketServerResponse)
 
     if not ok or response == nil or response == "" then
         return nil   -- no-op this frame (Python not ready yet)

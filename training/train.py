@@ -343,6 +343,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device",     default="auto")
     parser.add_argument("--sb3",        action="store_true",
                         help="Use SB3 native training loop instead of custom loop")
+    parser.add_argument("--api-key",    default=None,
+                        help="Anthropic API key (overrides ANTHROPIC_API_KEY env var)")
     return parser.parse_args()
 
 
@@ -360,6 +362,7 @@ def main() -> None:
         llm_model=args.llm_model,
         planner_interval=args.planner_interval,
         device=args.device,
+        anthropic_api_key=args.api_key,
     )
 
     Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
