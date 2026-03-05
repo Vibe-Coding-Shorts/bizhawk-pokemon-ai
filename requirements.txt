@@ -1,0 +1,17 @@
+# Core RL
+gymnasium>=0.29.0
+stable-baselines3>=2.3.0
+torch>=2.0.0
+
+# Anthropic SDK (LLM planner)
+anthropic>=0.40.0
+
+# Numerics
+numpy>=1.24.0
+
+# Visualisation (optional but recommended)
+matplotlib>=3.7.0
+Pillow>=10.0.0
+
+# Utilities
+tqdm>=4.65.0
