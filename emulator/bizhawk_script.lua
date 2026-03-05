@@ -295,16 +295,23 @@ end
 -- ---------------------------------------------------------------------------
 -- BizHawk comm API setup
 -- ---------------------------------------------------------------------------
--- BizHawk's built-in comm object connects to an external TCP server.
--- No luasocket or require() needed.
+-- BizHawk's comm socket must be enabled at launch via command line:
+--   EmuHawk.exe --socket_ip=127.0.0.1 --socket_port=65432
 --
--- comm.socketServerSetPort(port)    – port of the Python TCP server
+-- DO NOT call comm.socketServerSetPort() here – that requires the socket
+-- to already be initialised, which only happens via the CLI args above.
+--
 -- comm.socketServerSetTimeout(ms)   – how long to wait for a response
 -- comm.socketServerResponse(data)   – send data, return response string
 -- ---------------------------------------------------------------------------
 
-comm.socketServerSetPort(CONFIG.port)
-comm.socketServerSetTimeout(2000)   -- 2 second timeout per exchange
+-- Wrap in pcall: BizHawk tries to connect immediately, which fails if Python
+-- isn't running yet.  We catch the error so the script keeps running and
+-- retries on every communicate() call (which is already wrapped in pcall).
+local _ok, _err = pcall(comm.socketServerSetTimeout, 2000)
+if not _ok then
+    console.log("[LUA] Socket not ready (start Python server first): " .. tostring(_err))
+end
 
 -- Send game state JSON, receive action string from Python
 local function communicate(state)
