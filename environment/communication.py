@@ -167,7 +167,7 @@ class EmulatorBridge:
         self._server_sock: Optional[socket.socket] = None
         self._client_sock: Optional[socket.socket] = None
         self._client_file = None          # file wrapper for line-by-line reading
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         self._server_thread: Optional[threading.Thread] = None
         self._recv_thread: Optional[threading.Thread] = None
