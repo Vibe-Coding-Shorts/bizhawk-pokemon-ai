@@ -346,45 +346,39 @@ local function communicate(state)
 end
 
 -- ---------------------------------------------------------------------------
--- Main loop
+-- Main loop  (loop-based: required in BizHawk 2.11 to keep the script alive)
 -- ---------------------------------------------------------------------------
 local frame_counter = 0
 
 console.log("[LUA] Pokémon Blue AI script starting…")
 console.log("[LUA] Connecting to Python server on port " .. CONFIG.port)
 console.log("[LUA] Start the Python training script first, then this script.")
+console.log("[LUA] Running main loop…")
 
--- Register per-frame callback
-event.onframestart(function()
+while true do
     frame_counter = frame_counter + 1
 
     -- Apply any held button every frame for smooth input
     step_input()
 
     -- Only communicate every frame_skip frames
-    if frame_counter % CONFIG.frame_skip ~= 0 then
-        return
+    if frame_counter % CONFIG.frame_skip == 0 then
+        -- Read game state
+        local state = read_game_state()
+
+        -- Draw HUD overlay
+        if CONFIG.debug then
+            draw_hud(state)
+        end
+
+        -- Send state to Python, receive action
+        local action = communicate(state)
+
+        -- Apply action if received
+        if action ~= nil then
+            apply_action(action)
+        end
     end
 
-    -- Read game state
-    local state = read_game_state()
-
-    -- Draw HUD overlay
-    if CONFIG.debug then
-        draw_hud(state)
-    end
-
-    -- Send state to Python, receive action
-    local action = communicate(state)
-
-    -- Apply action if received
-    if action ~= nil then
-        apply_action(action)
-    end
-end)
-
-event.onexit(function()
-    console.log("[LUA] Script exiting.")
-end)
-
-console.log("[LUA] Event handlers registered. Running…")
+    emu.frameadvance()
+end
