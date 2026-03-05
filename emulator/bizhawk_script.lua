@@ -2,7 +2,14 @@
 -- BizHawk Lua Script: Pokémon Blue AI Interface
 -- =============================================================================
 -- Runs inside BizHawk and acts as the bridge between the emulator and the
--- external Python AI system. Communicates via TCP socket (luasocket).
+-- external Python AI system.
+--
+-- Communication: uses BizHawk's built-in comm API (no luasocket needed).
+--   comm.socketServerSetPort(port)      -- set Python server port
+--   comm.socketServerSetTimeout(ms)     -- connection/read timeout
+--   comm.socketServerResponse(data)     -- send JSON state, receive action
+--
+-- Python runs a TCP server; BizHawk connects to it as a client.
 --
 -- Memory addresses for Pokémon Blue (Game Boy):
 --   Player X:          0xD362
@@ -23,7 +30,7 @@
 --   Party Levels:      0xD18C (slot1), 0xD1B8 (slot2), ...
 -- =============================================================================
 
-local socket = require("socket")
+-- No require() needed – comm is a BizHawk built-in
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -286,125 +293,69 @@ local function draw_hud(state)
 end
 
 -- ---------------------------------------------------------------------------
--- TCP socket server / client setup
+-- BizHawk comm API setup
 -- ---------------------------------------------------------------------------
--- Strategy: BizHawk Lua acts as a TCP client connecting to the Python server.
--- Python runs a socket server on port 65432 and waits for connections.
--- Protocol:  Lua → Python: JSON state line  (terminated by \n)
---            Python → Lua: single decimal action index + \n
+-- BizHawk's built-in comm object connects to an external TCP server.
+-- No luasocket or require() needed.
+--
+-- comm.socketServerSetPort(port)    – port of the Python TCP server
+-- comm.socketServerSetTimeout(ms)   – how long to wait for a response
+-- comm.socketServerResponse(data)   – send data, return response string
 -- ---------------------------------------------------------------------------
 
-local conn = nil
-local connected = false
+comm.socketServerSetPort(CONFIG.port)
+comm.socketServerSetTimeout(2000)   -- 2 second timeout per exchange
 
-local function try_connect()
-    local c = socket.tcp()
-    c:settimeout(0.5)
-    local ok, err = c:connect(CONFIG.host, CONFIG.port)
-    if ok then
-        c:settimeout(0)   -- non-blocking after connect
-        conn = c
-        connected = true
-        console.log("[LUA] Connected to Python AI server at " .. CONFIG.host .. ":" .. CONFIG.port)
-        return true
-    else
-        c:close()
-        console.log("[LUA] Could not connect: " .. tostring(err) .. " – retrying…")
-        return false
-    end
-end
-
-local function disconnect()
-    if conn then
-        pcall(function() conn:close() end)
-        conn = nil
-    end
-    connected = false
-end
-
--- Send game state JSON and receive action
-local recv_buf = ""
-
+-- Send game state JSON, receive action string from Python
 local function communicate(state)
-    if not connected then return nil end
-
-    -- Serialise and send state
     local json_str = to_json(state) .. "\n"
-    local ok, err = conn:send(json_str)
-    if not ok then
-        console.log("[LUA] Send error: " .. tostring(err))
-        disconnect()
+
+    -- comm.socketServerResponse() sends json_str to the Python TCP server
+    -- and returns whatever Python sends back (the action string).
+    local ok, response = pcall(comm.socketServerResponse, json_str)
+
+    if not ok or response == nil or response == "" then
+        return nil   -- no-op this frame (Python not ready yet)
+    end
+
+    -- Strip whitespace / newline
+    response = response:match("^%s*(.-)%s*$")
+
+    -- Parse special commands
+    if response == "SAVE" then
+        save_state()
+        return nil
+    elseif response == "LOAD" or response == "RESET" then
+        load_state()
         return nil
     end
 
-    -- Wait briefly for response (up to ~60 ms in 10 ms polling steps)
-    local action_line = nil
-    for _ = 1, 6 do
-        local chunk, err2 = conn:receive("*l")
-        if chunk then
-            action_line = chunk
-            break
-        elseif err2 ~= "timeout" then
-            console.log("[LUA] Receive error: " .. tostring(err2))
-            disconnect()
-            return nil
-        end
-        socket.sleep(0.01)
+    local action_idx = tonumber(response)
+    if action_idx ~= nil then
+        return math.floor(action_idx)
     end
 
-    if action_line then
-        -- Parse special commands
-        if action_line == "SAVE" then
-            save_state()
-            return nil
-        elseif action_line == "LOAD" then
-            load_state()
-            return nil
-        elseif action_line == "RESET" then
-            load_state()
-            return nil
-        end
-        local action_idx = tonumber(action_line)
-        if action_idx ~= nil then
-            return math.floor(action_idx)
-        end
-    end
-
-    return nil  -- no-op this frame
+    return nil  -- no-op
 end
 
 -- ---------------------------------------------------------------------------
 -- Main loop
 -- ---------------------------------------------------------------------------
-local frame_counter   = 0
-local reconnect_timer = 0
-local RECONNECT_INTERVAL = 120  -- frames between reconnect attempts
+local frame_counter = 0
 
 console.log("[LUA] Pokémon Blue AI script starting…")
-console.log("[LUA] Waiting for Python server on " .. CONFIG.host .. ":" .. CONFIG.port)
-
--- Initial connection attempt
-try_connect()
+console.log("[LUA] Connecting to Python server on port " .. CONFIG.port)
+console.log("[LUA] Start the Python training script first, then this script.")
 
 -- Register per-frame callback
 event.onframestart(function()
     frame_counter = frame_counter + 1
 
-    -- Step held input every frame
+    -- Apply any held button every frame for smooth input
     step_input()
 
     -- Only communicate every frame_skip frames
     if frame_counter % CONFIG.frame_skip ~= 0 then
-        return
-    end
-
-    -- Attempt reconnect if not connected
-    if not connected then
-        reconnect_timer = reconnect_timer + 1
-        if reconnect_timer >= RECONNECT_INTERVAL then
-            reconnect_timer = 0
-            try_connect()
-        end
         return
     end
 
@@ -416,7 +367,7 @@ event.onframestart(function()
         draw_hud(state)
     end
 
-    -- Communicate with Python
+    -- Send state to Python, receive action
     local action = communicate(state)
 
     -- Apply action if received
@@ -425,10 +376,8 @@ event.onframestart(function()
     end
 end)
 
--- Graceful shutdown on script stop
 event.onexit(function()
-    console.log("[LUA] Script exiting, closing connection.")
-    disconnect()
+    console.log("[LUA] Script exiting.")
 end)
 
 console.log("[LUA] Event handlers registered. Running…")
