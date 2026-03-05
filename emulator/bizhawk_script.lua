@@ -305,7 +305,13 @@ end
 -- comm.socketServerResponse(data)   – send data, return response string
 -- ---------------------------------------------------------------------------
 
-comm.socketServerSetTimeout(2000)   -- 2 second timeout per exchange
+-- Wrap in pcall: BizHawk tries to connect immediately, which fails if Python
+-- isn't running yet.  We catch the error so the script keeps running and
+-- retries on every communicate() call (which is already wrapped in pcall).
+local _ok, _err = pcall(comm.socketServerSetTimeout, 2000)
+if not _ok then
+    console.log("[LUA] Socket not ready (start Python server first): " .. tostring(_err))
+end
 
 -- Send game state JSON, receive action string from Python
 local function communicate(state)
