@@ -295,15 +295,16 @@ end
 -- ---------------------------------------------------------------------------
 -- BizHawk comm API setup
 -- ---------------------------------------------------------------------------
--- BizHawk's built-in comm object connects to an external TCP server.
--- No luasocket or require() needed.
+-- BizHawk's comm socket must be enabled at launch via command line:
+--   EmuHawk.exe --socket_ip=127.0.0.1 --socket_port=65432
 --
--- comm.socketServerSetPort(port)    – port of the Python TCP server
+-- DO NOT call comm.socketServerSetPort() here – that requires the socket
+-- to already be initialised, which only happens via the CLI args above.
+--
 -- comm.socketServerSetTimeout(ms)   – how long to wait for a response
 -- comm.socketServerResponse(data)   – send data, return response string
 -- ---------------------------------------------------------------------------
 
-comm.socketServerSetPort(CONFIG.port)
 comm.socketServerSetTimeout(2000)   -- 2 second timeout per exchange
 
 -- Send game state JSON, receive action string from Python
