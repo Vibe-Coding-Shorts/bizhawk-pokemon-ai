@@ -319,37 +319,40 @@ if not _ok then
     console.log("[LUA] Socket not ready (start Python server first): " .. tostring(_err))
 end
 
--- Send game state JSON, receive action string from Python
-local _comm_attempts = 0   -- diagnostic counter
+-- Send game state JSON, receive action string from Python.
+--
+-- BizHawk's socket API (no-arg form):
+--   comm.socketServerSend(data)    → send data to Python
+--   comm.socketServerResponse()    → block until Python sends a line, return it
+--
+-- Protocol: Python sends an action first (including the initial no-op on
+-- connect), then BizHawk reads it and sends the current game state.
 local function communicate(state)
-    local json_str = to_json(state) .. "\n"
-
-    -- comm.socketServerResponse(data) is the standard BizHawk comm API:
-    -- it sends `data` to Python and blocks until Python sends a response back.
-    local ok, response = pcall(comm.socketServerResponse, json_str)
-
-    -- Log the first 5 attempts so we can see exactly what's happening
-    _comm_attempts = _comm_attempts + 1
-    if _comm_attempts <= 5 then
-        console.log(string.format(
-            "[LUA] comm#%d ok=%s response='%.40s'",
-            _comm_attempts, tostring(ok), tostring(response)
-        ))
-    end
-
-    if not ok or response == nil or response == "" then
-        return nil   -- no-op this frame (Python not ready yet)
+    -- 1. Read the action Python already sent (blocks up to the timeout)
+    local ok_r, response = pcall(comm.socketServerResponse)
+    if not ok_r or response == nil or response == "" then
+        return nil   -- Python not ready yet
     end
 
     -- Strip whitespace / newline
     response = response:match("^%s*(.-)%s*$")
 
-    -- Parse special commands
+    -- Handle special commands BEFORE sending state back
     if response == "SAVE" then
         save_state()
+        -- Send state so Python gets its next round-trip
+        pcall(comm.socketServerSend, to_json(state) .. "\n")
         return nil
     elseif response == "LOAD" or response == "RESET" then
         load_state()
+        -- After loading, send the (now-reset) state
+        pcall(comm.socketServerSend, to_json(read_game_state()) .. "\n")
+        return nil
+    end
+
+    -- 2. Send current game state to Python
+    local ok_s, _ = pcall(comm.socketServerSend, to_json(state) .. "\n")
+    if not ok_s then
         return nil
     end
 

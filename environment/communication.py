@@ -261,6 +261,11 @@ class EmulatorBridge:
                     self._client_file = self._client_sock.makefile("r", encoding="utf-8")
                     self.connected = True
 
+                # Send initial no-op so BizHawk's first socketServerResponse()
+                # call unblocks immediately (protocol: Python sends action first,
+                # then BizHawk sends state).
+                self._send_raw("7\n")
+
                 self._recv_thread = threading.Thread(
                     target=self._recv_loop, daemon=True, name="emulator-recv"
                 )
