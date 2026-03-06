@@ -323,15 +323,9 @@ end
 local function communicate(state)
     local json_str = to_json(state) .. "\n"
 
-    -- BizHawk 2.11+: comm.socketServerResponse() takes no arguments.
-    -- Use comm.socketServerSend() to push data, then socketServerResponse()
-    -- to read the reply.
-    local ok_send, _ = pcall(comm.socketServerSend, json_str)
-    if not ok_send then
-        return nil   -- no-op this frame (Python not ready yet)
-    end
-
-    local ok, response = pcall(comm.socketServerResponse)
+    -- comm.socketServerResponse(data) is the standard BizHawk comm API:
+    -- it sends `data` to Python and blocks until Python sends a response back.
+    local ok, response = pcall(comm.socketServerResponse, json_str)
 
     if not ok or response == nil or response == "" then
         return nil   -- no-op this frame (Python not ready yet)
