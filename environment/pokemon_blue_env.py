@@ -189,14 +189,8 @@ class PokemonBlueEnv(gym.Env):
         self._stuck_steps = 0
 
         logger.info("Resetting episode (reloading BizHawk savestate)…")
+        # reset_episode() raises RuntimeError on timeout
         emu_state = self.bridge.reset_episode()
-
-        if emu_state is None:
-            raise RuntimeError(
-                "Timed out waiting for emulator after reset. "
-                "Is BizHawk running with the Lua script active?"
-            )
-
         state = emu_state.to_game_state()
         self._prev_state = state
         self._prev_emulator_state = emu_state
