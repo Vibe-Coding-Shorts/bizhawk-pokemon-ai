@@ -305,54 +305,30 @@ end
 -- comm.socketServerResponse(data)   – send data, return response string
 -- ---------------------------------------------------------------------------
 
--- Configure socket connection to Python server.
--- These calls set the IP/port so BizHawk 2.11+ does NOT require the
--- --socket_ip / --socket_port command-line flags at launch.
-pcall(comm.socketServerSetIp, CONFIG.host)
-pcall(comm.socketServerSetPort, CONFIG.port)
+-- The socket connection is established by launching BizHawk with:
+--   EmuHawk.exe --socket_ip=127.0.0.1 --socket_port=65432
+-- DO NOT call comm.socketServerSetIp/Port here — those calls disrupt the
+-- CLI-established connection and cause subsequent comm calls to throw errors.
+comm.socketServerSetTimeout(2000)
 
--- Wrap in pcall: BizHawk tries to connect immediately, which fails if Python
--- isn't running yet.  We catch the error so the script keeps running and
--- retries on every communicate() call (which is already wrapped in pcall).
-local _ok, _err = pcall(comm.socketServerSetTimeout, 2000)
-if not _ok then
-    console.log("[LUA] Socket not ready (start Python server first): " .. tostring(_err))
-end
-
--- Send game state JSON, receive action string from Python.
---
--- BizHawk's socket API (no-arg form):
---   comm.socketServerSend(data)    → send data to Python
---   comm.socketServerResponse()    → block until Python sends a line, return it
---
--- Protocol: Python sends an action first (including the initial no-op on
--- connect), then BizHawk reads it and sends the current game state.
+-- Send game state JSON to Python, receive action string back.
+-- comm.socketServerResponse(data) sends `data` and blocks until Python replies.
 local function communicate(state)
-    -- 1. Read the action Python already sent (blocks up to the timeout)
-    local ok_r, response = pcall(comm.socketServerResponse)
-    if not ok_r or response == nil or response == "" then
-        return nil   -- Python not ready yet
+    local json_str = to_json(state) .. "\n"
+    local ok, response = pcall(comm.socketServerResponse, json_str)
+    if not ok or response == nil or response == "" then
+        return nil   -- Python not ready yet / timeout
     end
 
     -- Strip whitespace / newline
     response = response:match("^%s*(.-)%s*$")
 
-    -- Handle special commands BEFORE sending state back
+    -- Parse special commands
     if response == "SAVE" then
         save_state()
-        -- Send state so Python gets its next round-trip
-        pcall(comm.socketServerSend, to_json(state) .. "\n")
         return nil
     elseif response == "LOAD" or response == "RESET" then
         load_state()
-        -- After loading, send the (now-reset) state
-        pcall(comm.socketServerSend, to_json(read_game_state()) .. "\n")
-        return nil
-    end
-
-    -- 2. Send current game state to Python
-    local ok_s, _ = pcall(comm.socketServerSend, to_json(state) .. "\n")
-    if not ok_s then
         return nil
     end
 
