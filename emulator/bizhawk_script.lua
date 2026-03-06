@@ -320,12 +320,22 @@ if not _ok then
 end
 
 -- Send game state JSON, receive action string from Python
+local _comm_attempts = 0   -- diagnostic counter
 local function communicate(state)
     local json_str = to_json(state) .. "\n"
 
     -- comm.socketServerResponse(data) is the standard BizHawk comm API:
     -- it sends `data` to Python and blocks until Python sends a response back.
     local ok, response = pcall(comm.socketServerResponse, json_str)
+
+    -- Log the first 5 attempts so we can see exactly what's happening
+    _comm_attempts = _comm_attempts + 1
+    if _comm_attempts <= 5 then
+        console.log(string.format(
+            "[LUA] comm#%d ok=%s response='%.40s'",
+            _comm_attempts, tostring(ok), tostring(response)
+        ))
+    end
 
     if not ok or response == nil or response == "" then
         return nil   -- no-op this frame (Python not ready yet)
