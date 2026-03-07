@@ -1,170 +1,141 @@
 -- =============================================================================
 -- BizHawk Lua Script: Pokémon Blue AI Interface
+-- Compatible with BizHawk 2.11 (Gambatte core, Game Boy)
 -- =============================================================================
--- Runs inside BizHawk and acts as the bridge between the emulator and the
--- external Python AI system.
 --
--- Communication: uses BizHawk's built-in comm API (no luasocket needed).
---   comm.socketServerSetPort(port)      -- set Python server port
---   comm.socketServerSetTimeout(ms)     -- connection/read timeout
---   comm.socketServerResponse(data)     -- send JSON state, receive action
+-- LAUNCH BIZHAWK WITH:
+--   EmuHawk.exe --socket_ip=127.0.0.1 --socket_port=65432
 --
--- Python runs a TCP server; BizHawk connects to it as a client.
+-- The --socket_ip / --socket_port flags establish the TCP connection to the
+-- Python server automatically. Do NOT call comm.socketServerSetIp/Port from
+-- Lua – those calls reconnect the socket and break the CLI-established link.
 --
--- Memory addresses for Pokémon Blue (Game Boy):
+-- BizHawk 2.11 socket comm API (comm library):
+--   comm.socketServerSetTimeout(ms)  – set read timeout (call once at startup)
+--   comm.socketServerSend(msg)       – send plain-text to Python server
+--   comm.socketServerResponse()      – read Python's reply; Python MUST format
+--                                      replies as "$<len> <msg>" (since 2.6.2)
+--
+-- Protocol (per communicate() call):
+--   Lua  → Python : JSON game state, newline-terminated  (plain text)
+--   Python → Lua  : "$N action_or_cmd"  where N = byte length of payload
+--                   Lua receives just the payload (BizHawk strips the prefix)
+--
+-- Special commands Python can send:
+--   SAVE  – save BizHawk state to slot 1
+--   RESET – load BizHawk state from slot 1 (episode reset)
+--
+-- Memory addresses (Pokémon Blue / Red USA, Gambatte core):
 --   Player X:          0xD362
 --   Player Y:          0xD361
 --   Map ID:            0xD35E
 --   In Battle:         0xD057  (0=none, 1=wild, 2=trainer)
 --   Party Count:       0xD163
---   Party HP (slot 1 current): 0xD16C–0xD16D  (big-endian u16)
---   Party HP (slot 1 max):     0xD18D–0xD18E
---   Enemy HP (current):        0xCFE6–0xCFE7
---   Enemy HP (max):            0xCFEA–0xCFEB  (approx)
---   Player Money:      0xD347–0xD349  (BCD, 3 bytes)
---   Badge Count:       0xD356
---   Pokédex Seen:      0xD30A  (count)
---   Pokédex Caught:    0xD2F7  (count)
---   Game Clock (h):    0xDA40
---   Game Clock (m):    0xDA41
---   Party Levels:      0xD18C (slot1), 0xD1B8 (slot2), ...
+--   Party HP cur/max:  0xD16C/0xD18D (slot 1), +44 bytes per slot
+--   Party Level:       0xD18C (slot 1), +44 bytes per slot
+--   Party Species:     0xD164–0xD169
+--   Enemy HP cur:      0xCFE6 (2 bytes BE)
+--   Enemy HP max:      0xCFEA (2 bytes BE)
+--   Enemy Species:     0xCFD8
+--   Money:             0xD347 (3 bytes BCD)
+--   Badges:            0xD356 (bitfield, popcount = badge count)
+--   Pokédex Seen:      0xD30A
+--   Pokédex Caught:    0xD2F7
+--   Game Clock h/m:    0xDA40 / 0xDA41
+--   Text on screen:    0xD730
 -- =============================================================================
-
--- No require() needed – comm is a BizHawk built-in
 
 -- ---------------------------------------------------------------------------
 -- Configuration
 -- ---------------------------------------------------------------------------
 local CONFIG = {
-    host          = "127.0.0.1",
     port          = 65432,
-    frame_skip    = 4,        -- send state every N frames
-    action_hold   = 8,        -- hold each button for N frames
-    fast_forward  = false,    -- toggle with hotkey
-    debug         = true,
-    savestate_slot = 1,
+    frame_skip    = 4,       -- communicate every N frames
+    action_hold   = 8,       -- hold each button for N frames
+    savestate_slot = 1,      -- BizHawk save-state slot for episode resets
+    debug_hud     = true,    -- draw overlay on screen
 }
 
 -- ---------------------------------------------------------------------------
--- Memory addresses (Pokémon Blue / Red share the same map)
+-- Memory addresses
 -- ---------------------------------------------------------------------------
 local ADDR = {
-    player_x         = 0xD362,
-    player_y         = 0xD361,
-    map_id           = 0xD35E,
-    in_battle        = 0xD057,
-    party_count      = 0xD163,
-    -- Party slot HP (current / max) – slot offsets of 44 bytes each
-    party_hp_cur     = { 0xD16C, 0xD198, 0xD1C4, 0xD1F0, 0xD21C, 0xD248 },
-    party_hp_max     = { 0xD18D, 0xD1B9, 0xD1E5, 0xD211, 0xD23D, 0xD269 },
-    party_level      = { 0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268 },
-    party_species    = { 0xD164, 0xD165, 0xD166, 0xD167, 0xD168, 0xD169 },
-    enemy_hp_cur     = 0xCFE6,
-    enemy_hp_max     = 0xCFEA,
-    enemy_species    = 0xCFD8,
-    money            = 0xD347,   -- 3 bytes BCD
-    badges           = 0xD356,
-    pokedex_seen     = 0xD30A,
-    pokedex_caught   = 0xD2F7,
-    clock_hours      = 0xDA40,
-    clock_minutes    = 0xDA41,
-    -- Warp / text flags
-    text_on_screen   = 0xD730,
-    overworld_loop   = 0xD72E,
-    -- Items in bag (first 4 slots for quick snapshot)
-    bag_item1        = 0xD31E,
-    bag_item1_count  = 0xD31F,
-    bag_item2        = 0xD320,
-    bag_item2_count  = 0xD321,
+    player_x        = 0xD362,
+    player_y        = 0xD361,
+    map_id          = 0xD35E,
+    in_battle       = 0xD057,
+    party_count     = 0xD163,
+    -- Slot offsets: each party member occupies 44 bytes past slot 1 base
+    party_hp_cur    = { 0xD16C, 0xD198, 0xD1C4, 0xD1F0, 0xD21C, 0xD248 },
+    party_hp_max    = { 0xD18D, 0xD1B9, 0xD1E5, 0xD211, 0xD23D, 0xD269 },
+    party_level     = { 0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268 },
+    party_species   = { 0xD164, 0xD165, 0xD166, 0xD167, 0xD168, 0xD169 },
+    enemy_hp_cur    = 0xCFE6,
+    enemy_hp_max    = 0xCFEA,
+    enemy_species   = 0xCFD8,
+    money           = 0xD347,   -- 3 bytes BCD
+    badges          = 0xD356,
+    pokedex_seen    = 0xD30A,
+    pokedex_caught  = 0xD2F7,
+    clock_hours     = 0xDA40,
+    clock_minutes   = 0xDA41,
+    text_on_screen  = 0xD730,
+    bag_item1       = 0xD31E,
+    bag_item1_cnt   = 0xD31F,
+    bag_item2       = 0xD320,
+    bag_item2_cnt   = 0xD321,
 }
 
 -- ---------------------------------------------------------------------------
--- Button mapping  (BizHawk joypad key names)
--- ---------------------------------------------------------------------------
-local BUTTONS = {
-    "Up", "Down", "Left", "Right",
-    "A", "B", "Start", "Select",
-}
-
--- Action index → button name (matches Python action_space)
+-- Action index → BizHawk joypad button name
 -- 0=Up 1=Down 2=Left 3=Right 4=A 5=B 6=Start 7=NoOp
+-- ---------------------------------------------------------------------------
 local ACTION_MAP = {
-    [0] = "Up",
-    [1] = "Down",
-    [2] = "Left",
-    [3] = "Right",
-    [4] = "A",
-    [5] = "B",
-    [6] = "Start",
-    [7] = nil,   -- no-op
+    [0] = "Up", [1] = "Down", [2] = "Left", [3] = "Right",
+    [4] = "A",  [5] = "B",    [6] = "Start", [7] = nil,
 }
 
 -- ---------------------------------------------------------------------------
--- Helper: read big-endian unsigned 16-bit value
+-- Memory helpers
 -- ---------------------------------------------------------------------------
 local function read_u16_be(addr)
-    local hi = memory.read_u8(addr)
-    local lo = memory.read_u8(addr + 1)
-    return hi * 256 + lo
+    return memory.read_u8(addr) * 256 + memory.read_u8(addr + 1)
 end
 
--- ---------------------------------------------------------------------------
--- Helper: decode 3-byte BCD money value
--- ---------------------------------------------------------------------------
 local function read_money()
+    local function bcd(b) return (math.floor(b / 16) * 10) + (b % 16) end
     local b1 = memory.read_u8(ADDR.money)
     local b2 = memory.read_u8(ADDR.money + 1)
     local b3 = memory.read_u8(ADDR.money + 2)
-    -- Each byte encodes two BCD digits
-    local function bcd(b) return (math.floor(b / 16) * 10) + (b % 16) end
     return bcd(b1) * 10000 + bcd(b2) * 100 + bcd(b3)
 end
 
--- ---------------------------------------------------------------------------
--- Helper: count set bits (popcount) for badge/seen/caught bytes
--- ---------------------------------------------------------------------------
-local function popcount_byte(b)
-    local count = 0
-    while b > 0 do
-        count = count + (b % 2)
-        b = math.floor(b / 2)
-    end
-    return count
-end
-
--- Count total badges (8 bits across 1 byte)
-local function count_badges()
-    local b = memory.read_u8(ADDR.badges)
-    return popcount_byte(b)
+local function popcount(b)
+    local n = 0
+    while b > 0 do n = n + (b % 2); b = math.floor(b / 2) end
+    return n
 end
 
 -- ---------------------------------------------------------------------------
--- Build game state table
+-- Build game-state table (read from emulator RAM)
 -- ---------------------------------------------------------------------------
 local function read_game_state()
     local party_count = memory.read_u8(ADDR.party_count)
-    -- Clamp to valid range
     if party_count > 6 then party_count = 0 end
 
-    -- Party HP / levels / species
     local party = {}
     for i = 1, math.max(party_count, 1) do
-        local hp_cur = read_u16_be(ADDR.party_hp_cur[i])
-        local hp_max = read_u16_be(ADDR.party_hp_max[i])
-        local level  = memory.read_u8(ADDR.party_level[i])
-        local species = memory.read_u8(ADDR.party_species[i])
         table.insert(party, {
-            species = species,
-            level   = level,
-            hp_cur  = hp_cur,
-            hp_max  = hp_max,
+            species = memory.read_u8(ADDR.party_species[i]),
+            level   = memory.read_u8(ADDR.party_level[i]),
+            hp_cur  = read_u16_be(ADDR.party_hp_cur[i]),
+            hp_max  = read_u16_be(ADDR.party_hp_max[i]),
         })
     end
 
-    -- Battle state
-    local in_battle    = memory.read_u8(ADDR.in_battle)
-    local enemy_hp_cur = 0
-    local enemy_hp_max = 0
+    local in_battle     = memory.read_u8(ADDR.in_battle)
+    local enemy_hp_cur  = 0
+    local enemy_hp_max  = 0
     local enemy_species = 0
     if in_battle > 0 then
         enemy_hp_cur  = read_u16_be(ADDR.enemy_hp_cur)
@@ -172,67 +143,53 @@ local function read_game_state()
         enemy_species = memory.read_u8(ADDR.enemy_species)
     end
 
-    -- First bag items (quick snapshot)
-    local bag = {
-        { id = memory.read_u8(ADDR.bag_item1),  count = memory.read_u8(ADDR.bag_item1_count) },
-        { id = memory.read_u8(ADDR.bag_item2),  count = memory.read_u8(ADDR.bag_item2_count) },
-    }
-
-    local state = {
-        frame         = emu.framecount(),
-        player_x      = memory.read_u8(ADDR.player_x),
-        player_y      = memory.read_u8(ADDR.player_y),
-        map_id        = memory.read_u8(ADDR.map_id),
-        in_battle     = in_battle,
-        party_count   = party_count,
-        party         = party,
-        enemy_hp_cur  = enemy_hp_cur,
-        enemy_hp_max  = enemy_hp_max,
-        enemy_species = enemy_species,
-        money         = read_money(),
-        badges        = count_badges(),
-        pokedex_seen  = memory.read_u8(ADDR.pokedex_seen),
+    return {
+        frame          = emu.framecount(),
+        player_x       = memory.read_u8(ADDR.player_x),
+        player_y       = memory.read_u8(ADDR.player_y),
+        map_id         = memory.read_u8(ADDR.map_id),
+        in_battle      = in_battle,
+        party_count    = party_count,
+        party          = party,
+        enemy_hp_cur   = enemy_hp_cur,
+        enemy_hp_max   = enemy_hp_max,
+        enemy_species  = enemy_species,
+        money          = read_money(),
+        badges         = popcount(memory.read_u8(ADDR.badges)),
+        pokedex_seen   = memory.read_u8(ADDR.pokedex_seen),
         pokedex_caught = memory.read_u8(ADDR.pokedex_caught),
-        clock_hours   = memory.read_u8(ADDR.clock_hours),
-        clock_minutes = memory.read_u8(ADDR.clock_minutes),
+        clock_hours    = memory.read_u8(ADDR.clock_hours),
+        clock_minutes  = memory.read_u8(ADDR.clock_minutes),
         text_on_screen = memory.read_u8(ADDR.text_on_screen),
-        bag           = bag,
+        bag = {
+            { id = memory.read_u8(ADDR.bag_item1), count = memory.read_u8(ADDR.bag_item1_cnt) },
+            { id = memory.read_u8(ADDR.bag_item2), count = memory.read_u8(ADDR.bag_item2_cnt) },
+        },
     }
-
-    return state
 end
 
 -- ---------------------------------------------------------------------------
--- Serialise table to a compact JSON-like string (no external lib needed)
+-- Minimal JSON serialiser (no external library needed)
 -- ---------------------------------------------------------------------------
-local function to_json(val, depth)
-    depth = depth or 0
+local function to_json(val)
     local t = type(val)
-
     if t == "nil"     then return "null"
     elseif t == "boolean" then return tostring(val)
     elseif t == "number"  then
-        -- Handle integers vs floats cleanly
-        if val == math.floor(val) then return tostring(math.floor(val))
-        else return tostring(val) end
+        if val ~= val then return "null" end   -- NaN guard
+        return (val == math.floor(val)) and tostring(math.floor(val)) or tostring(val)
     elseif t == "string"  then
-        -- Escape special chars
-        val = val:gsub('\\', '\\\\'):gsub('"', '\\"')
-                 :gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
-        return '"' .. val .. '"'
+        return '"' .. val:gsub('\\','\\\\'):gsub('"','\\"')
+                         :gsub('\n','\\n'):gsub('\r','\\r'):gsub('\t','\\t') .. '"'
     elseif t == "table" then
-        -- Detect array vs object
-        local is_array = (#val > 0)
-        if is_array then
+        if #val > 0 then
             local parts = {}
-            for _, v in ipairs(val) do
-                table.insert(parts, to_json(v, depth + 1))
-            end
+            for _, v in ipairs(val) do parts[#parts+1] = to_json(v) end
             return "[" .. table.concat(parts, ",") .. "]"
         else
             local parts = {}
             for k, v in pairs(val) do
-                table.insert(parts, '"' .. tostring(k) .. '":' .. to_json(v, depth + 1))
+                parts[#parts+1] = '"' .. tostring(k) .. '":' .. to_json(v)
             end
             return "{" .. table.concat(parts, ",") .. "}"
         end
@@ -241,107 +198,115 @@ local function to_json(val, depth)
 end
 
 -- ---------------------------------------------------------------------------
--- Apply a button action for one frame
+-- Joypad input helpers
 -- ---------------------------------------------------------------------------
-local held_button   = nil
-local hold_counter  = 0
+local held_button  = nil
+local hold_counter = 0
 
-local function apply_action(action_idx)
-    local btn = ACTION_MAP[action_idx]
-    held_button  = btn
+local function apply_action(idx)
+    held_button  = ACTION_MAP[idx]   -- nil = NoOp
     hold_counter = CONFIG.action_hold
 end
 
 local function step_input()
-    local inputs = {}
     if hold_counter > 0 and held_button ~= nil then
-        inputs[held_button] = true
+        joypad.set({ [held_button] = true }, 1)
         hold_counter = hold_counter - 1
+    else
+        joypad.set({}, 1)
     end
-    joypad.set(inputs, 1)
 end
 
 -- ---------------------------------------------------------------------------
--- Save / Load state helpers
+-- Save-state helpers (slot-based; Python resets episodes via "RESET" command)
 -- ---------------------------------------------------------------------------
 local function save_state()
     savestate.saveslot(CONFIG.savestate_slot)
-    if CONFIG.debug then
-        console.log("[LUA] State saved to slot " .. CONFIG.savestate_slot)
-    end
+    console.log("[LUA] Saved state to slot " .. CONFIG.savestate_slot)
 end
 
 local function load_state()
     savestate.loadslot(CONFIG.savestate_slot)
-    if CONFIG.debug then
-        console.log("[LUA] State loaded from slot " .. CONFIG.savestate_slot)
-    end
+    console.log("[LUA] Loaded state from slot " .. CONFIG.savestate_slot)
 end
 
 -- ---------------------------------------------------------------------------
--- Screen overlay (debug HUD)
+-- Debug HUD overlay
 -- ---------------------------------------------------------------------------
-local function draw_hud(state)
-    local x, y = 2, 2
-    gui.text(x, y,      string.format("Map:%d  X:%d Y:%d", state.map_id, state.player_x, state.player_y), "white")
-    gui.text(x, y + 10, string.format("Battle:%d  Money:%d", state.in_battle, state.money), "yellow")
-    if state.party_count > 0 and state.party[1] then
-        local p = state.party[1]
-        gui.text(x, y + 20, string.format("Lv%d HP:%d/%d", p.level, p.hp_cur, p.hp_max), "lime")
+local function draw_hud(s)
+    gui.text(2,  2, string.format("Map:%d  X:%d Y:%d", s.map_id, s.player_x, s.player_y), "white")
+    gui.text(2, 12, string.format("Battle:%d  Money:%d", s.in_battle, s.money), "yellow")
+    if s.party_count > 0 and s.party[1] then
+        local p = s.party[1]
+        gui.text(2, 22, string.format("Lv%d HP:%d/%d", p.level, p.hp_cur, p.hp_max), "lime")
     end
-    gui.text(x, y + 30, string.format("Badges:%d  Seen:%d", state.badges, state.pokedex_seen), "cyan")
+    gui.text(2, 32, string.format("Badges:%d Seen:%d Caught:%d",
+        s.badges, s.pokedex_seen, s.pokedex_caught), "cyan")
 end
 
 -- ---------------------------------------------------------------------------
--- BizHawk comm API setup
+-- Socket setup
 -- ---------------------------------------------------------------------------
--- BizHawk's comm socket must be enabled at launch via command line:
+-- The connection to Python is established automatically by the CLI flags:
 --   EmuHawk.exe --socket_ip=127.0.0.1 --socket_port=65432
 --
--- DO NOT call comm.socketServerSetPort() here – that requires the socket
--- to already be initialised, which only happens via the CLI args above.
+-- socketServerSetTimeout sets how long socketServerResponse() blocks before
+-- giving up (milliseconds). 3000ms gives Python enough time to respond even
+-- if it is momentarily busy with RL inference or LLM calls.
 --
--- comm.socketServerSetTimeout(ms)   – how long to wait for a response
--- comm.socketServerResponse(data)   – send data, return response string
+-- DO NOT call comm.socketServerSetIp() or comm.socketServerSetPort() here –
+-- those reconnect the socket and break the CLI-established connection.
 -- ---------------------------------------------------------------------------
+comm.socketServerSetTimeout(3000)
 
--- The socket connection is established by launching BizHawk with:
---   EmuHawk.exe --socket_ip=127.0.0.1 --socket_port=65432
--- DO NOT call comm.socketServerSetIp/Port here — those calls disrupt the
--- CLI-established connection and cause subsequent comm calls to throw errors.
-comm.socketServerSetTimeout(2000)
-
--- Send game state JSON to Python, receive action string back.
--- comm.socketServerResponse(data) sends `data` and blocks until Python replies.
+-- ---------------------------------------------------------------------------
+-- communicate(state) – send game state to Python, receive action back
+--
+-- Uses the two-step BizHawk 2.11 API:
+--   1. comm.socketServerSend(json)        – send state (plain text)
+--   2. comm.socketServerResponse()        – read Python's reply
+--      Python MUST reply with "$<len> <payload>" (length-prefixed).
+--      BizHawk strips the prefix; this function receives just <payload>.
+--
+-- Returns action index (0–7) or nil (no-op / not connected).
+-- ---------------------------------------------------------------------------
 local function communicate(state)
     local json_str = to_json(state) .. "\n"
-    local ok, response = pcall(comm.socketServerResponse, json_str)
-    if not ok or response == nil or response == "" then
-        return nil   -- Python not ready yet / timeout
+
+    -- Step 1: send state to Python
+    local ok_send, send_err = pcall(comm.socketServerSend, json_str)
+    if not ok_send then
+        -- Connection not ready yet; Python may not have started
+        return nil
     end
 
-    -- Strip whitespace / newline
+    -- Step 2: read Python's response (blocks up to socketServerSetTimeout ms)
+    -- Python sends: "$N payload" where N = byte length of payload
+    -- BizHawk parses the length-prefix and returns just the payload string.
+    local ok_recv, response = pcall(comm.socketServerResponse)
+    if not ok_recv or response == nil or response == "" then
+        return nil
+    end
+
+    -- Trim whitespace
     response = response:match("^%s*(.-)%s*$")
 
-    -- Parse special commands
+    -- Handle special commands
     if response == "SAVE" then
         save_state()
-        return nil
-    elseif response == "LOAD" or response == "RESET" then
+        return nil   -- no joypad input this frame
+    elseif response == "RESET" or response == "LOAD" then
         load_state()
-        return nil
+        return nil   -- Python will receive the post-reset state next frame
     end
 
-    local action_idx = tonumber(response)
-    if action_idx ~= nil then
-        return math.floor(action_idx)
-    end
-
-    return nil  -- no-op
+    -- Parse numeric action index
+    local n = tonumber(response)
+    return n and math.floor(n) or nil
 end
 
 -- ---------------------------------------------------------------------------
--- Main loop  (loop-based: required in BizHawk 2.11 to keep the script alive)
+-- Main loop
 -- ---------------------------------------------------------------------------
 local frame_counter = 0
 
@@ -353,23 +318,18 @@ console.log("[LUA] Running main loop…")
 while true do
     frame_counter = frame_counter + 1
 
-    -- Apply any held button every frame for smooth input
+    -- Apply held button every frame for smooth movement
     step_input()
 
-    -- Only communicate every frame_skip frames
+    -- Communicate every frame_skip frames
     if frame_counter % CONFIG.frame_skip == 0 then
-        -- Read game state
-        local state = read_game_state()
+        local state  = read_game_state()
 
-        -- Draw HUD overlay
-        if CONFIG.debug then
+        if CONFIG.debug_hud then
             draw_hud(state)
         end
 
-        -- Send state to Python, receive action
         local action = communicate(state)
-
-        -- Apply action if received
         if action ~= nil then
             apply_action(action)
         end

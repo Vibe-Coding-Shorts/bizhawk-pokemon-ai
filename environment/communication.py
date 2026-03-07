@@ -1,17 +1,33 @@
 """
 communication.py
 ================
-TCP socket server that the BizHawk Lua script connects to.
+TCP server that the BizHawk Lua script connects to.
 
-Protocol
---------
-  Lua  → Python : JSON-encoded game state, newline-terminated
-  Python → Lua  : ASCII action index ("0"–"7") or command, newline-terminated
+Protocol (BizHawk 2.11)
+-----------------------
+  Lua → Python   : JSON-encoded game state, newline-terminated (plain text)
+  Python → Lua   : length-prefixed reply: "$<len> <payload>"
+                   BizHawk's comm.socketServerResponse() reads the prefix,
+                   validates the length, then returns just <payload> to Lua.
 
-Special commands Python can send to Lua:
-  "SAVE"  – save BizHawk state to slot
-  "LOAD"  – load BizHawk state from slot
-  "RESET" – alias for LOAD (reload savestate = episode reset)
+  Examples of valid Python→Lua messages:
+    "$1 7"        action 7 (NoOp)
+    "$1 0"        action 0 (Up)
+    "$5 RESET"    reload savestate (episode reset)
+    "$4 SAVE"     save current state to slot
+
+Special payloads Python can send to Lua:
+  "SAVE"  – Lua saves BizHawk state to slot 1
+  "RESET" – Lua loads BizHawk state from slot 1 (episode reset)
+
+reset_episode() flow
+--------------------
+1. Python sets _reset_flag, clears _reset_event.
+2. On the next Lua→Python exchange, _recv_loop sends "RESET" to BizHawk.
+3. BizHawk loads the savestate and on the very next frame sends a fresh state.
+4. _recv_loop reads that post-reset state, sends a NoOp response, then
+   signals _reset_event and puts the state on the queue.
+5. reset_episode() unblocks and returns the post-reset state.
 """
 
 from __future__ import annotations
@@ -20,7 +36,6 @@ import json
 import logging
 import socket
 import threading
-import time
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import Optional
@@ -31,44 +46,44 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Dataclass that wraps the raw dict sent by Lua into a typed object
+# Data classes
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PartyMember:
     species: int = 0
-    level: int = 0
-    hp_cur: int = 0
-    hp_max: int = 0
+    level:   int = 0
+    hp_cur:  int = 0
+    hp_max:  int = 0
 
 
 @dataclass
 class BagItem:
-    id: int = 0
+    id:    int = 0
     count: int = 0
 
 
 @dataclass
 class EmulatorState:
     """Structured snapshot received from BizHawk each step."""
-    frame: int = 0
-    player_x: int = 0
-    player_y: int = 0
-    map_id: int = 0
-    in_battle: int = 0          # 0=none, 1=wild, 2=trainer
-    party_count: int = 0
-    party: list[PartyMember] = field(default_factory=list)
-    enemy_hp_cur: int = 0
-    enemy_hp_max: int = 0
-    enemy_species: int = 0
-    money: int = 0
-    badges: int = 0
-    pokedex_seen: int = 0
+    frame:          int = 0
+    player_x:       int = 0
+    player_y:       int = 0
+    map_id:         int = 0
+    in_battle:      int = 0   # 0=none, 1=wild, 2=trainer
+    party_count:    int = 0
+    party:          list[PartyMember] = field(default_factory=list)
+    enemy_hp_cur:   int = 0
+    enemy_hp_max:   int = 0
+    enemy_species:  int = 0
+    money:          int = 0
+    badges:         int = 0
+    pokedex_seen:   int = 0
     pokedex_caught: int = 0
-    clock_hours: int = 0
-    clock_minutes: int = 0
+    clock_hours:    int = 0
+    clock_minutes:  int = 0
     text_on_screen: int = 0
-    bag: list[BagItem] = field(default_factory=list)
+    bag:            list[BagItem] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "EmulatorState":
@@ -79,43 +94,36 @@ class EmulatorState:
             "money", "badges", "pokedex_seen", "pokedex_caught",
             "clock_hours", "clock_minutes", "text_on_screen",
         ):
-            setattr(state, key, d.get(key, 0))
+            setattr(state, key, int(d.get(key, 0)))
 
         state.party = [
             PartyMember(
-                species=m.get("species", 0),
-                level=m.get("level", 0),
-                hp_cur=m.get("hp_cur", 0),
-                hp_max=m.get("hp_max", 0),
+                species=int(m.get("species", 0)),
+                level=int(m.get("level", 0)),
+                hp_cur=int(m.get("hp_cur", 0)),
+                hp_max=int(m.get("hp_max", 0)),
             )
             for m in d.get("party", [])
         ]
         state.bag = [
-            BagItem(id=b.get("id", 0), count=b.get("count", 0))
+            BagItem(id=int(b.get("id", 0)), count=int(b.get("count", 0)))
             for b in d.get("bag", [])
         ]
         return state
 
     @property
     def player_hp(self) -> int:
-        if self.party:
-            return self.party[0].hp_cur
-        return 0
+        return self.party[0].hp_cur if self.party else 0
 
     @property
     def player_hp_max(self) -> int:
-        if self.party:
-            return self.party[0].hp_max
-        return 1
+        return self.party[0].hp_max if self.party else 1
 
     @property
     def player_level(self) -> int:
-        if self.party:
-            return self.party[0].level
-        return 0
+        return self.party[0].level if self.party else 0
 
     def to_game_state(self) -> GameState:
-        """Convert to the GameState used by the reward function."""
         return GameState(
             player_x=self.player_x,
             player_y=self.player_y,
@@ -140,46 +148,57 @@ class EmulatorState:
 
 class EmulatorBridge:
     """
-    Runs a TCP server in a background thread.
-    The BizHawk Lua script connects as a client.
+    Runs a TCP server; BizHawk connects as a client (via --socket_ip/port).
 
-    Usage
-    -----
-    bridge = EmulatorBridge(host="127.0.0.1", port=65432)
-    bridge.start()
-    state = bridge.get_state(timeout=5.0)   # blocks until a frame arrives
-    bridge.send_action(4)                    # send action index
-    bridge.stop()
+    Thread model
+    ------------
+    _accept_loop  – waits for BizHawk to connect, spawns _recv_loop.
+    _recv_loop    – per-exchange: read JSON state → send length-prefixed reply.
+
+    Public API (called from the main training thread)
+    --------------------------------------------------
+    start()                    – bind, listen, start accept thread.
+    stop()                     – shut down everything.
+    send_action(action: int)   – queue action index for next exchange.
+    send_command(cmd: str)     – queue special command (e.g. "SAVE").
+    get_state(timeout) → EmulatorState | None
+    reset_episode()    → EmulatorState  (raises RuntimeError on timeout)
     """
 
-    def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 65432,
-        state_queue_size: int = 4,
-    ):
+    _NOOP = "7"
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 65432):
         self.host = host
         self.port = port
 
-        self._state_queue: Queue[EmulatorState] = Queue(maxsize=state_queue_size)
-        self._action_queue: Queue[str] = Queue(maxsize=1)
+        # State queue: recv_loop puts states here; get_state() consumes them.
+        self._state_queue: Queue[EmulatorState] = Queue(maxsize=8)
+
+        # Pending action/command to send on the next Lua→Python exchange.
+        # Protected by _lock.
+        self._pending: str = self._NOOP
+
+        # Reset protocol flags (see reset_episode() docstring).
+        self._reset_flag  = False
+        self._reset_event = threading.Event()
+
+        self._lock = threading.Lock()
 
         self._server_sock: Optional[socket.socket] = None
         self._client_sock: Optional[socket.socket] = None
-        self._client_file = None          # file wrapper for line-by-line reading
-        self._lock = threading.RLock()
+        self._client_file = None
 
         self._server_thread: Optional[threading.Thread] = None
-        self._recv_thread: Optional[threading.Thread] = None
+        self._recv_thread:   Optional[threading.Thread] = None
         self._running = False
         self.connected = False
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the TCP server and begin listening."""
+        """Bind the TCP server socket and start the accept thread."""
         self._running = True
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -194,7 +213,7 @@ class EmulatorBridge:
         self._server_thread.start()
 
     def stop(self) -> None:
-        """Shut everything down cleanly."""
+        """Shut down the bridge gracefully."""
         self._running = False
         self._disconnect_client()
         if self._server_sock:
@@ -206,98 +225,155 @@ class EmulatorBridge:
             self._server_thread.join(timeout=2.0)
 
     def get_state(self, timeout: float = 10.0) -> Optional[EmulatorState]:
-        """
-        Block until a new state arrives from the emulator.
-        Returns None on timeout.
-        """
+        """Block until the next emulator state arrives. Returns None on timeout."""
         try:
             return self._state_queue.get(timeout=timeout)
         except Empty:
             return None
 
     def send_action(self, action: int) -> None:
-        """Queue an action to be sent to the emulator."""
-        # Drain old pending action first (non-blocking)
-        try:
-            self._action_queue.get_nowait()
-        except Empty:
-            pass
-        self._action_queue.put(str(action))
+        """Queue an action index (0–7) to send on the next exchange."""
+        with self._lock:
+            self._pending = str(int(action))
 
     def send_command(self, cmd: str) -> None:
-        """Send a special command: SAVE, LOAD, RESET."""
+        """Queue a special command (e.g. 'SAVE') to send on the next exchange."""
+        with self._lock:
+            self._pending = cmd
+
+    def reset_episode(self) -> EmulatorState:
+        """
+        Trigger a savestate reload in BizHawk and return the post-reset state.
+
+        Steps:
+        1. Set _reset_flag so _recv_loop sends "RESET" on the next exchange.
+        2. Wait for _reset_event (set by _recv_loop after the post-reset state
+           is queued).
+        3. Return the post-reset EmulatorState from the queue.
+
+        Raises RuntimeError if BizHawk does not respond within 30 s.
+        """
+        self._reset_event.clear()
+        with self._lock:
+            self._reset_flag = True
+            self._pending = self._NOOP  # clear any stale pending action
+
+        if not self._reset_event.wait(timeout=30.0):
+            raise RuntimeError(
+                "Timed out waiting for emulator after reset. "
+                "Is BizHawk running with the Lua script active?"
+            )
+
         try:
-            self._action_queue.get_nowait()
+            return self._state_queue.get(timeout=5.0)
         except Empty:
-            pass
-        self._action_queue.put(cmd)
+            raise RuntimeError("Reset state missing from queue after event signal.")
 
-    def reset_episode(self) -> Optional[EmulatorState]:
-        """Tell emulator to reload savestate, then wait for next state."""
-        self.send_command("RESET")
-        # Flush any stale states from the queue
-        time.sleep(0.1)
-        while not self._state_queue.empty():
-            try:
-                self._state_queue.get_nowait()
-            except Empty:
-                break
-        return self.get_state(timeout=15.0)
-
-    # ------------------------------------------------------------------ #
-    # Internal threads                                                     #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Internal threads
+    # ------------------------------------------------------------------
 
     def _accept_loop(self) -> None:
-        """Accept a single client connection, then hand off to recv thread."""
+        """Accept client connections and hand off to _recv_loop."""
         while self._running:
             try:
                 client, addr = self._server_sock.accept()
-                logger.info("Emulator connected from %s", addr)
-                with self._lock:
-                    self._disconnect_client()
-                    self._client_sock = client
-                    self._client_sock.settimeout(None)
-                    self._client_file = self._client_sock.makefile("r", encoding="utf-8")
-                    self.connected = True
-
-                self._recv_thread = threading.Thread(
-                    target=self._recv_loop, daemon=True, name="emulator-recv"
-                )
-                self._recv_thread.start()
-                self._recv_thread.join()  # wait until connection drops
-
             except socket.timeout:
                 continue
             except Exception as exc:
                 if self._running:
-                    logger.error("Accept loop error: %s", exc)
+                    logger.error("Accept error: %s", exc)
                 break
+
+            logger.info("Emulator connected from %s", addr)
+            with self._lock:
+                self._disconnect_client()
+                self._client_sock = client
+                self._client_sock.settimeout(None)   # blocking reads
+                self._client_file = self._client_sock.makefile(
+                    "r", encoding="utf-8"
+                )
+                self.connected = True
+
+            self._recv_thread = threading.Thread(
+                target=self._recv_loop, daemon=True, name="emulator-recv"
+            )
+            self._recv_thread.start()
+            self._recv_thread.join()   # block until connection drops
+
+        logger.info("Accept loop exiting.")
 
     def _recv_loop(self) -> None:
         """
-        Receive JSON state lines from Lua, put them on the state queue,
-        and immediately send back the queued action.
+        Core exchange loop.
+
+        For every JSON line received from Lua:
+          1. Decide what to reply (reset, queued action, or NoOp).
+          2. Send the reply in BizHawk's length-prefixed format: "$N payload".
+          3a. Normal reply: put the received state on the queue.
+          3b. RESET reply: read the post-reset state, send NoOp for it, then
+              clear the queue, put the post-reset state, and fire _reset_event.
         """
         while self._running and self.connected:
             try:
                 line = self._client_file.readline()
-                if not line:
-                    logger.warning("Emulator disconnected.")
-                    break
+            except Exception as exc:
+                if self._running:
+                    logger.error("Socket read error: %s", exc)
+                break
 
-                line = line.strip()
-                if not line:
-                    continue
+            if not line:
+                logger.warning("Emulator disconnected (EOF).")
+                break
 
-                try:
-                    raw = json.loads(line)
-                    state = EmulatorState.from_dict(raw)
-                except json.JSONDecodeError as exc:
-                    logger.warning("JSON parse error: %s | raw: %.120s", exc, line)
-                    continue
+            line = line.strip()
+            if not line:
+                continue
 
-                # Drop oldest state if queue is full (prefer freshness)
+            # Parse JSON state
+            try:
+                raw   = json.loads(line)
+                state = EmulatorState.from_dict(raw)
+            except (json.JSONDecodeError, Exception) as exc:
+                logger.warning("JSON parse error: %s | raw: %.120s", exc, line)
+                # Send NoOp so BizHawk's socketServerResponse() unblocks
+                self._bzk_send(self._NOOP)
+                continue
+
+            # Determine reply
+            with self._lock:
+                if self._reset_flag:
+                    self._reset_flag = False
+                    reply = "RESET"
+                else:
+                    reply = self._pending
+                    self._pending = self._NOOP  # consume; default next to NoOp
+
+            # Send reply to BizHawk in "$N payload" format
+            self._bzk_send(reply)
+
+            if reply in ("RESET", "LOAD"):
+                # The pre-reset state is discarded.
+                # BizHawk loads the savestate and immediately calls
+                # communicate() again, sending the post-reset state.
+                post_state = self._read_post_reset_state()
+                if post_state is None:
+                    break   # connection dropped during reset
+
+                # Send NoOp for the post-reset exchange so BizHawk unblocks.
+                self._bzk_send(self._NOOP)
+
+                # Clear any stale pre-reset states and queue the fresh one.
+                while not self._state_queue.empty():
+                    try:
+                        self._state_queue.get_nowait()
+                    except Empty:
+                        break
+                self._state_queue.put(post_state)
+                self._reset_event.set()
+
+            else:
+                # Normal exchange: queue the received state (drop oldest if full).
                 if self._state_queue.full():
                     try:
                         self._state_queue.get_nowait()
@@ -305,26 +381,47 @@ class EmulatorBridge:
                         pass
                 self._state_queue.put(state)
 
-                # Immediately send pending action (or no-op "7")
-                try:
-                    action_str = self._action_queue.get_nowait()
-                except Empty:
-                    action_str = "7"  # no-op
-
-                self._send_raw(action_str + "\n")
-
-            except Exception as exc:
-                if self._running:
-                    logger.error("Recv loop error: %s", exc)
-                break
-
         self._disconnect_client()
 
-    def _send_raw(self, data: str) -> None:
+    def _read_post_reset_state(self) -> Optional[EmulatorState]:
+        """
+        Read the single state BizHawk sends right after processing RESET.
+        Returns None if the connection drops.
+        """
+        try:
+            line = self._client_file.readline()
+        except Exception as exc:
+            logger.error("Error reading post-reset state: %s", exc)
+            return None
+
+        if not line:
+            logger.warning("Connection dropped while waiting for post-reset state.")
+            return None
+
+        try:
+            return EmulatorState.from_dict(json.loads(line.strip()))
+        except (json.JSONDecodeError, Exception) as exc:
+            logger.error("Could not parse post-reset state: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Low-level send helpers
+    # ------------------------------------------------------------------
+
+    def _bzk_send(self, payload: str) -> None:
+        """
+        Send a reply to BizHawk in the required length-prefixed format.
+
+        BizHawk 2.6.2+ requires comm.socketServerResponse() replies to be:
+            "$<byte_length> <payload>"
+        BizHawk reads exactly <byte_length> bytes after the space and returns
+        that as the Lua string.  No trailing newline needed.
+        """
+        data = f"${len(payload)} {payload}".encode("utf-8")
         with self._lock:
             if self._client_sock:
                 try:
-                    self._client_sock.sendall(data.encode("utf-8"))
+                    self._client_sock.sendall(data)
                 except Exception as exc:
                     logger.error("Send error: %s", exc)
                     self.connected = False
