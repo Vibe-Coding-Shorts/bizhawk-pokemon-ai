@@ -25,13 +25,26 @@ if exist "venv\Scripts\activate.bat" (
     echo [RUN] No venv found, using system Python.
 )
 
+:: Install / update dependencies if requirements.txt is present
+if exist "requirements.txt" (
+    echo [RUN] Installing dependencies from requirements.txt...
+    pip install -r requirements.txt --quiet
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] pip install failed. Check your internet connection and Python install.
+        echo.
+        pause
+        exit /b 1
+    )
+    echo [RUN] Dependencies OK.
+)
+
 :: Verify Python can find the training module
 python -c "import training" 2>nul
 if errorlevel 1 (
     echo.
     echo [ERROR] Cannot import training module.
-    echo         Make sure you are in the project root and have run:
-    echo           pip install -r requirements.txt
+    echo         Make sure you are running this from the project root folder.
     echo.
     pause
     exit /b 1
