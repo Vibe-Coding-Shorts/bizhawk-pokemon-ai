@@ -182,7 +182,7 @@ class EmulatorBridge:
         self._reset_flag  = False
         self._reset_event = threading.Event()
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()   # re-entrant: _accept_loop calls _disconnect_client inside the lock
 
         self._server_sock: Optional[socket.socket] = None
         self._client_sock: Optional[socket.socket] = None
