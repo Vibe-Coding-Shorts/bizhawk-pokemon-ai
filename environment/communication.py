@@ -5,16 +5,16 @@ TCP server that the BizHawk Lua script connects to.
 
 Protocol (BizHawk 2.11)
 -----------------------
-  Lua → Python   : JSON-encoded game state, newline-terminated (plain text)
-  Python → Lua   : length-prefixed reply: "$<len> <payload>"
-                   BizHawk's comm.socketServerResponse() reads the prefix,
-                   validates the length, then returns just <payload> to Lua.
+  Lua → Python   : comm.socketServerSend() prepends the byte length:
+                       "345 {...json...}\n"
+                   Python strips the "N " prefix, then parses the JSON.
 
-  Examples of valid Python→Lua messages:
-    "$1 7"        action 7 (NoOp)
-    "$1 0"        action 0 (Up)
-    "$5 RESET"    reload savestate (episode reset)
-    "$4 SAVE"     save current state to slot
+  Python → Lua   : comm.socketServerResponse() expects "$<len> <payload>":
+                       "$1 7"      action 7 (NoOp)
+                       "$1 0"      action 0 (Up)
+                       "$5 RESET"  reload savestate
+                       "$4 SAVE"   save to slot
+                   BizHawk validates the length and returns <payload> to Lua.
 
 Special payloads Python can send to Lua:
   "SAVE"  – Lua saves BizHawk state to slot 1
@@ -330,6 +330,11 @@ class EmulatorBridge:
             if not line:
                 continue
 
+            # comm.socketServerSend() in BizHawk prepends the byte length:
+            #   "345 {...json...}"
+            # Strip that leading "N " before parsing JSON.
+            line = self._strip_length_prefix(line)
+
             # Parse JSON state
             try:
                 raw   = json.loads(line)
@@ -399,14 +404,29 @@ class EmulatorBridge:
             return None
 
         try:
-            return EmulatorState.from_dict(json.loads(line.strip()))
+            return EmulatorState.from_dict(
+                json.loads(self._strip_length_prefix(line.strip()))
+            )
         except (json.JSONDecodeError, Exception) as exc:
             logger.error("Could not parse post-reset state: %s", exc)
             return None
 
     # ------------------------------------------------------------------
-    # Low-level send helpers
+    # Low-level helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _strip_length_prefix(line: str) -> str:
+        """
+        BizHawk's comm.socketServerSend() prepends the byte length:
+            "345 {...json...}"
+        Strip the leading "N " so we can parse the JSON cleanly.
+        If the line doesn't start with a digit the data is returned as-is.
+        """
+        idx = line.find(' ')
+        if idx > 0 and line[:idx].isdigit():
+            return line[idx + 1:]
+        return line
 
     def _bzk_send(self, payload: str) -> None:
         """
