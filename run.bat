@@ -77,9 +77,18 @@ echo.
 echo [RUN] Starting Python training server...
 start "Pokemon AI - Python" cmd /k "python -m training.train %PYTHON_ARGS%"
 
-:: Step 2: Wait for Python to bind its socket (usually < 1 s, 4 s is safe).
-echo [RUN] Waiting for Python to start listening (4 s)...
-timeout /t 4 /nobreak >nul
+:: Step 2: Wait until Python is actually listening on port 65432.
+::   torch + stable_baselines3 imports can take 15-30 s on first run.
+::   We poll netstat every 2 s instead of using a fixed sleep so BizHawk
+::   never tries to connect before the socket is ready.
+echo [RUN] Waiting for Python to open port 65432...
+:wait_loop
+netstat -an | find "65432" | find "LISTENING" >nul 2>&1
+if errorlevel 1 (
+    timeout /t 2 /nobreak >nul
+    goto wait_loop
+)
+echo [RUN] Port 65432 is ready.
 
 :: Step 3: Launch BizHawk with the socket connection flags.
 ::   --socket_ip / --socket_port tell BizHawk to connect to Python's server.
