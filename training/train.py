@@ -161,7 +161,7 @@ def training_loop(cfg: TrainingConfig) -> None:
         episode_t0      = time.time()
         done            = False
 
-        logger.info("── Episode %d | goal=%s ──", episode_num, env.goal)
+        logger.info("-- Episode %d | goal=%s --", episode_num, env.goal)
 
         # ── Per-episode step loop ────────────────────────────────────────
         while not done and not _shutdown_requested:
