@@ -242,6 +242,8 @@ local function draw_hud(s)
     end
     gui.text(2, 32, string.format("Badges:%d Seen:%d Caught:%d",
         s.badges, s.pokedex_seen, s.pokedex_caught), "cyan")
+    local btn_label = held_button or "NoOp"
+    gui.text(2, 42, string.format("Btn:%s (%d)", btn_label, hold_counter), "orange")
 end
 
 -- ---------------------------------------------------------------------------
